@@ -70,9 +70,8 @@ class Version {
   // Append to *iters a sequence of iterators that will
   // yield the contents of this Version when merged together.
   // REQUIRES: This version has been saved (see VersionSet::SaveTo)
-  // 追加一系列iterator到 @*iters中，
-  // 将在merge到一起时生成该Version的内容
-  // 要求: Version已经保存了(见VersionSet::SaveTo)
+  // 为该Version中的所有sstable都创建一个Two Level
+  // Iterator，以遍历sstable的内容。
   void AddIterators(const ReadOptions&, std::vector<Iterator*>* iters);
 
   // Lookup the value for key.  If found, store it in *val and

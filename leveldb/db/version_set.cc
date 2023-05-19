@@ -231,20 +231,23 @@ Iterator* Version::NewConcatenatingIterator(const ReadOptions& options,
 // DBImpl::NewIterator()->DBImpl::NewInternalIterator()->Version::AddIterators()。
 // 函数功能是为该Version中的所有sstable都创建一个Two Level
 // Iterator，以遍历sstable的内容。
-// 对于level=0级别的sstable文件，直接通过TableCache::NewIterator()接口创建，这会直接载入sstable文件到内存cache中。
-// 对于level>0级别的sstable文件，通过函数NewTwoLevelIterator()创建一个TwoLevelIterator，这就使用了lazy
-// open的机制。
 void Version::AddIterators(const ReadOptions& options,
                            std::vector<Iterator*>* iters) {
+  // 对于level=0级别的sstable文件，直接通过TableCache::NewIterator()接口创建，这会直接载入sstable文件到内存cache中。
+  // 因为第0层sst文件被读的概率更高，可能因为第0层无
+  // 序，所以一个文件对应一个Iterator
   // Merge all level zero files together since they may overlap
   for (size_t i = 0; i < files_[0].size(); i++) {
     iters->push_back(vset_->table_cache_->NewIterator(
         options, files_[0][i]->number, files_[0][i]->file_size));
   }
+  // 对于level>0级别的sstable文件，通过函数NewTwoLevelIterator()创建一个TwoLevelIterator，这就使用了lazy
+  // open的机制。
 
   // For levels > 0, we can use a concatenating iterator that sequentially
   // walks through the non-overlapping files in the level, opening them
   // lazily.
+  // 其中每层对应一个Iterator，因为>0层的sst都是有序无重叠的
   for (int level = 1; level < config::kNumLevels; level++) {
     if (!files_[level].empty()) {
       iters->push_back(NewConcatenatingIterator(options, level));
@@ -933,6 +936,14 @@ Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu) {
   return s;
 }
 
+/*
+当正常运行期间，每当调用LogAndApply的时候，都会将VersionEdit作为一笔记录，追加写入到MANIFEST文件。
+我们知道VersionEdit就是记录数据库的一个版本到另一个版本间的sst文件变化情况以及各层合并点变化情况。
+注意，VersionEdit可以序列化，存进MANIFEST文件，同样道理，MANIFEST中可以将VersionEdit一个一个的重放出来。
+这个重放的目的，是为了得到当前的Version以及VersionSet。
+一般来讲，当打开的DB的时候，需要获得这种信息，而这种信息的获得，靠的就是所有VersionEdit
+按照次序一一回放，生成当前的Version。
+*/
 Status VersionSet::Recover(bool* save_manifest) {
   struct LogReporter : public log::Reader::Reporter {
     Status* status;
@@ -942,7 +953,9 @@ Status VersionSet::Recover(bool* save_manifest) {
   };
 
   // Read "CURRENT" file, which contains a pointer to the current manifest file
+  // 读取"CURRENT"文件的内容到current，该文件内容包含了最新的Manifest文件名。
   std::string current;
+  // CurrentFileName -> dbname/CURRENT
   Status s = ReadFileToString(env_, CurrentFileName(dbname_), &current);
   if (!s.ok()) {
     return s;
@@ -950,10 +963,14 @@ Status VersionSet::Recover(bool* save_manifest) {
   if (current.empty() || current[current.size() - 1] != '\n') {
     return Status::Corruption("CURRENT file does not end with newline");
   }
+  // 去掉文件名最后的'\n'
   current.resize(current.size() - 1);
 
+  // 获取完整的最新Manifest文件名
+  // 其中就存了个文件名
   std::string dscname = dbname_ + "/" + current;
   SequentialFile* file;
+  // 打开该Manifest文件
   s = env_->NewSequentialFile(dscname, &file);
   if (!s.ok()) {
     if (s.IsNotFound()) {
@@ -981,11 +998,15 @@ Status VersionSet::Recover(bool* save_manifest) {
                        0 /*initial_offset*/);
     Slice record;
     std::string scratch;
+    // 读取MANIFEST内容，MANIFEST是以log的方式写入的，因此这里调用的是log::Reader来读取。
     while (reader.ReadRecord(&record, &scratch) && s.ok()) {
       ++read_records;
+      // 然后调用VersionEdit::DecodeFrom，从内容解析出VersionEdit对象，并将VersionEdit记录的改动应用到versionset中
       VersionEdit edit;
       s = edit.DecodeFrom(record);
       if (s.ok()) {
+        // edit记录的user_comparator名一定要和当前打开数据库传入的user_comparator匹配
+        // 否则会出错，因为原来数据库生成的sst文件是按user_comparator排序的
         if (edit.has_comparator_ &&
             edit.comparator_ != icmp_.user_comparator()->Name()) {
           s = Status::InvalidArgument(
@@ -995,9 +1016,11 @@ Status VersionSet::Recover(bool* save_manifest) {
       }
 
       if (s.ok()) {
+        // 按照次序，讲Verison的变化量层层回放，最重会得到最终版本的Version
         builder.Apply(&edit);
       }
-
+      // 读取MANIFEST中的log number, prev log number, nextfile number, last
+      // sequence
       if (edit.has_log_number_) {
         log_number = edit.log_number_;
         have_log_number = true;
@@ -1034,7 +1057,8 @@ Status VersionSet::Recover(bool* save_manifest) {
     if (!have_prev_log_number) {
       prev_log_number = 0;
     }
-
+    // 将读取到的log number, prev log number标记为已使用。
+    // TODO: 没理解这个
     MarkFileNumberUsed(prev_log_number);
     MarkFileNumberUsed(log_number);
   }

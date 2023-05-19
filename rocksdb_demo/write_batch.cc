@@ -1,3 +1,4 @@
+#include <iostream>
 #include <rocksdb/db.h>
 #include <rocksdb/write_batch.h>
 
@@ -14,6 +15,11 @@ int main() {
   batch.Delete("key3");
 
   status = db->Write(rocksdb::WriteOptions(), &batch);
+
+  std::cout << batch.GetDataSize() << std::endl;
+  batch.Clear();
+  std::cout << batch.GetDataSize() << std::endl;
+  batch.Clear();
   assert(status.ok());
 
   delete db;
